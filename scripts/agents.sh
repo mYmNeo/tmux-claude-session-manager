@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Emit one picker row per running Claude that lives in a tmux pane.
+# Emit one picker row per running omp agent that lives in a tmux pane.
 #
-# Claude self-reports its status: each session writes its own state to disk. We
-# read those files, falling back to `claude agents --json`. So this needs no
-# Claude Code hooks, and no `pane_current_command` scan — on macOS a pane reports
-# its parent shell there, never the `claude` child running inside it.
+# Reads the session registry maintained live by the omp extension — written at
+# session_start with status "busy", then updated through lifecycle hooks
+# (agent_end → idle, tool_call ask → waiting) so the picker always sees
+# the current state.
+# The session id is derived from cwd by finding the most recent JSONL in the omp
+# session storage directory. That file's mtime is used for the age column — no
+# transcript daemon needed.
 #
-# Identity is the Claude process, not the tmux session. Joining pid -> tty -> pane
-# is what lets several Claudes in one project (same cwd, same session, different
+# Identity is the agent process, not the tmux session. Joining pid -> tty -> pane
+# is what lets several agents in one project (same cwd, same session, different
 # windows) each get a row of their own.
 #
 #   Row: rank \t pane_id \t pid \t kind \t icon \t age \t loc \t path
@@ -17,80 +20,56 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=helpers.sh
 . "$DIR/helpers.sh"
 
-# session_recs
-# `procStart` lets render() tell a live agent from a stale file; `statusUpdatedAt`
-# feeds the age column. The files are an internal Claude Code detail, so a missing
-# directory or a file caught mid-write fails this, and the caller asks the CLI.
-#
-#   Rec: pid \t status \t session-id \t cwd \t seen-at \t proc-start
-session_recs() {
-  local files
-  files=("${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/sessions/*.json)
-  [ -f "${files[0]}" ] || return 1
-  jq -r 'select(.kind == "interactive")
-    | ((.statusUpdatedAt // .updatedAt) as $t | if $t then ($t / 1000 | floor) else "" end) as $seen
-    | [.pid, .status, .sessionId, .cwd, $seen, .procStart] | @tsv' "${files[@]}" 2>/dev/null
-}
+OMP_DIR="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
+REGISTRY="$OMP_DIR/claude-session-manager/registry.json"
 
-# cli_recs
-# Fallback when the session files can't be read. It has already dropped dead
-# agents, so proc-start stays empty. It reports no last-activity time either; the
-# transcript's mtime stands in for it.
-cli_recs() {
-  $(get_tmux_option @claude_command 'claude') agents --json 2>/dev/null |
-    jq -r '.[] | select(.kind == "interactive") | [.pid, .status, .sessionId, .cwd] | @tsv' 2>/dev/null |
-    while IFS=$'\t' read -r pid status sid cwd; do
-      printf '%s\t%s\t%s\t%s\t%s\t\n' "$pid" "$status" "$sid" "$cwd" "$(claude_transcript_mtime "$sid")"
+# registry_recs
+# One rec per registry entry. The session id and last-activity time come from
+# the newest JSONL in the cwd's session bucket; an empty seen-at renders as '-'.
+#
+#   Rec: pid \t status \t session-id \t cwd \t seen-at
+registry_recs() {
+  [ -f "$REGISTRY" ] || return 1
+  jq -r '.[] | [.pid, .status, .cwd] | @tsv' "$REGISTRY" 2>/dev/null |
+    while IFS=$'\t' read -r pid status cwd; do
+      enc="-${cwd#"$HOME/"}"
+      enc="${enc//\//-}"
+      sid="unknown"
+      seen=""
+      newest="$(ls -t "$OMP_DIR/sessions/$enc"/*.jsonl 2>/dev/null | head -1)"
+      if [ -n "$newest" ]; then
+        sid="$(basename "$newest" .jsonl)"
+        seen="$(file_mtime "$newest")"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$status" "$sid" "$cwd" "$seen"
     done
 }
 
-# proc_starts <recs>
-# Linux only: Claude records field 22 of /proc/<pid>/stat as proc-start there.
-# Strip greedily past ") " first — field 2 is the parenthesised command name and
-# may itself contain ") " — which leaves field 22 as the 20th of what remains.
-proc_starts() {
-  printf '%s\n' "$1" | cut -f1 | while IFS= read -r pid; do
-    IFS= read -r stat 2>/dev/null <"/proc/$pid/stat" || continue
-    # shellcheck disable=SC2086 # deliberate split into positional parameters
-    set -- ${stat##*) }
-    [ $# -ge 20 ] && printf 'S\t%s\t%s\n' "$pid" "${20}"
-  done
-}
-
-# render <recs> <verify>
-# Tagged streams into one awk: pid->tty+start, tty->pane, and the agents. One `ps`
-# serves both joins, which matters on macOS where each call costs over 100ms.
+# render <recs>
+# Tagged streams into one awk: pid->tty, tty->pane, and the agents. A dead pid
+# has no `ps` line, so its stale registry entry drops out at the tty join.
 #
-# With <verify> set, the recs came from the session files and liveness is on us —
-# ctrl-x kills the pid on the row. A crashed Claude leaves its file behind and the
-# pid may since have been recycled, so a rec counts only while that pid still has
-# the start time the file recorded: `ps lstart` in UTC, or /proc on Linux. A rec
-# missing a field, or not one pid verified, means the format moved on: fail, so
-# the caller falls back to the CLI.
+# The pane that opened the picker (OMP_HOST_PANE, threaded in by list.sh) and
+# omp's own pane (@claude_omp_pane, recorded by the extension) are kind "host":
+# they sink to the bottom and carry no pid, so ctrl-x can never kill them.
 render() {
   {
-    # Rejoining the fields with single spaces undoes the padding of a
-    # single-digit day ("Sep  1").
-    TZ=UTC LC_ALL=C ps -o pid=,tty=,lstart= -p "$(printf '%s\n' "$1" | cut -f1 | paste -sd, -)" 2>/dev/null |
-      awk '{ print "P\t" $1 "\t" $2 "\t" $3 " " $4 " " $5 " " $6 " " $7 }'
-    [ -r /proc/self/stat ] && proc_starts "$1"
+    ps -o pid=,tty= -p "$(printf '%s\n' "$1" | cut -f1 | paste -sd, -)" 2>/dev/null |
+      awk '{ print "P\t" $1 "\t" $2 }'
     tmux list-panes -a -F $'T\t#{pane_tty}\t#{pane_id}\t#{session_name}\t#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null
     printf '%s\n' "$1" | sed $'s/^/A\t/'
-  } | awk -F'\t' -v verify="$2" -v now="$(date +%s)" -v home="$HOME" \
-    -v prefix="$(get_tmux_option @claude_session_prefix 'claude-')" '
-    $1 == "P" { tty_of[$2] = $3; start[$2] = $4; next }
-    $1 == "S" { start[$2] = $3; next }
+  } | awk -F'\t' -v now="$(date +%s)" -v home="$HOME" \
+    -v prefix="$(get_tmux_option @claude_session_prefix 'claude-')" \
+    -v self_pane="${OMP_HOST_PANE:-${TMUX_PANE:-}}" -v omp_pane="$(tmux show-options -gqv @claude_omp_pane 2>/dev/null)" '
+    $1 == "P" { tty_of[$2] = $3; next }
     $1 == "T" { sub(/^\/dev\//, "", $2); pane[$2] = $3; sess[$2] = $4; loc[$2] = $5; next }
     $1 == "A" && $2 != "" {
-      if (verify) {
-        if ($3 == "" || $4 == "" || $5 == "" || $7 == "") { bad = 1; exit }
-        gsub(/ +/, " ", $7)
-        if (start[$2] != $7) next             # stale file: dead, or the pid was recycled
-      }
-      live++
-
       tty = tty_of[$2]
-      if (tty == "" || !(tty in pane)) next   # this Claude is not running inside tmux
+      if (tty == "" || !(tty in pane)) next   # dead, or not running inside tmux
+
+      is_host = 0
+      if (self_pane != "" && pane[tty] == self_pane) is_host = 1
+      if (omp_pane != "" && pane[tty] == omp_pane) is_host = 1
 
       if      ($3 == "waiting") { icon = "\033[33m●\033[0m waiting"; rank = 0 }  # yellow - needs input
       else if ($3 == "idle")    { icon = "\033[32m●\033[0m idle   "; rank = 1 }  # green  - done, your turn
@@ -104,14 +83,15 @@ render() {
       else if (mins < 2880) age = int(mins / 60) "h"
       else                  age = int(mins / 1440) "d"
       kind = (index(sess[tty], prefix) == 1) ? "dedicated" : "loose"
+      if (is_host) { kind = "host"; rank = 4 }   # host entries sink to the bottom
 
       path = $5
       if (index(path, home) == 1) path = "~" substr(path, length(home) + 1)
 
+      pid = (is_host) ? "-" : $2
       printf "%d\t%s\t%s\t%s\t%s\t%s\t%5s\t%s\t%s\n",
-        secs, rank, pane[tty], $2, kind, icon, age, loc[tty], path
+        secs, rank, pane[tty], pid, kind, icon, age, loc[tty], path
     }
-    END { exit (bad || !live) }
   ' | sort -t$'\t' $sort_keys | cut -f2-
   # The age column mixes units ("5m", "3h", "2d"), so the sort runs on a leading
   # seconds column, cut off once it has served.
@@ -125,7 +105,7 @@ else
   sort_keys='-k2,2n -k1,1n'
 fi
 
-{ recs="$(session_recs)" && out="$(render "$recs" 1)"; } ||
-  { recs="$(cli_recs)" && out="$(render "$recs" '')"; } || exit 0
+recs="$(registry_recs)" && [ -n "$recs" ] || exit 0
+out="$(render "$recs")"
 [ -n "$out" ] && printf '%s\n' "$out"
 exit 0

@@ -38,26 +38,6 @@ file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 
-# claude_transcript_mtime <session-id>
-# Epoch seconds of the last write to that Claude session's transcript. Only the
-# CLI fallback in agents.sh needs it: `claude agents --json` reports `startedAt`
-# but never a last-activity time, so the transcript's mtime stands in for it. A
-# rough stand-in — Claude Code also touches the transcripts of idle sessions.
-#
-# Found by glob so we never have to reproduce Claude's cwd -> project-slug
-# encoding. The path is an internal Claude Code detail and may move; an empty
-# result just renders the age column as '-'.
-claude_transcript_mtime() {
-  local base f
-  base="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-  for f in "$base"/projects/*/"$1".jsonl; do
-    [ -f "$f" ] && {
-      file_mtime "$f"
-      return
-    }
-  done
-}
-
 # copy_to_clipboard <text>
 # Puts <text> in a tmux paste buffer and on the system clipboard. A native tool
 # is preferred; without one, `set-buffer -w` hands it to the outer terminal via

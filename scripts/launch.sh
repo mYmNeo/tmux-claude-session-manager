@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch (or re-attach to) a Claude session for a directory, shown in a popup.
+# Launch (or re-attach to) an omp session for a directory, shown in a popup.
 # Args: <dir> [origin-window-id]   (both expanded by run-shell in the binding)
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,7 +10,7 @@ path="${1:-$PWD}"
 window="${2:-}"
 
 prefix="$(get_tmux_option @claude_session_prefix 'claude-')"
-cmd="$(get_tmux_option @claude_command 'claude')"
+cmd="$(get_tmux_option @claude_command 'omp')"
 args="$(get_tmux_option @claude_args '')"
 [ -n "$args" ] && cmd="$cmd $args"
 w="$(get_tmux_option @claude_popup_width '90%')"

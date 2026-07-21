@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive picker for running Claude agents.
+# Interactive picker for running omp agents.
 #
 #   picker.sh           fzf picker; on enter, jumps to the chosen agent.
 #   picker.sh --list    print the rows and refresh the cache (used by fzf's
@@ -10,11 +10,11 @@
 #                       capture <pane> without its trailing blank lines, which
 #                       would otherwise leave fzf's `follow` scrolled onto padding.
 #
-# Rows come from agents.sh, which pairs each running Claude with the tmux pane it
+# Rows come from agents.sh, which pairs each running omp agent with the tmux pane it
 # occupies. Two kinds of row jump differently:
-#   dedicated  a Claude in a `claude-*` session this plugin launched — resumed in
+#   dedicated  an agent in a `claude-*` session this plugin launched — resumed in
 #              the popup, over the window it was launched from.
-#   loose      a Claude running in any other pane — focused in place.
+#   loose      an agent running in any other pane — focused in place.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=helpers.sh
@@ -47,7 +47,7 @@ if [ "${1:-}" = '--copy' ]; then
   exit 0
 fi
 
-for tool in fzf jq "$(get_tmux_option @claude_command 'claude')"; do
+for tool in fzf jq; do
   command -v "$tool" >/dev/null 2>&1 || {
     tmux display-message "tmux-claude-hatch: $tool is required for the picker"
     exit 0
@@ -78,11 +78,12 @@ fi
 
 # ctrl-x kills the Claude process itself: a dedicated session dies with its last
 # window, while a loose pane keeps the shell that hosted it. The reload waits a
-# beat so the process is gone by the time agents.sh looks for it.
+# beat so the process is gone by the time agents.sh looks for it. Host rows
+# carry pid "-", so ctrl-x on them is a no-op.
 # ctrl-y copies the agent's location (session:window.pane, e.g. claude-88074b0e:0.0)
 # and closes the picker.
 sel=$("${list_cmd[@]}" | fzf --ansi --delimiter='\t' --with-nth=5,6,7,8 \
-  --reverse --cycle --header='Claude agents · enter: jump · ctrl-x: kill · ctrl-y: copy' \
+  --reverse --cycle --header='omp agents · enter: jump · ctrl-x: kill · ctrl-y: copy' \
   --preview="$self --preview {2}" --preview-window='up,70%,follow' \
   --bind="ctrl-x:execute-silent(kill {3})+reload(sleep 0.3; $self --list)" \
   --bind="ctrl-y:execute-silent($self --copy {7})+abort" \
@@ -91,11 +92,17 @@ sel=$("${list_cmd[@]}" | fzf --ansi --delimiter='\t' --with-nth=5,6,7,8 \
   ${extra_opts[@]+"${extra_opts[@]}"})
 
 [ -z "$sel" ] && exit 0
-pane=$(printf '%s' "$sel" | cut -f2)
+
 kind=$(printf '%s' "$sel" | cut -f4)
+pane=$(printf '%s' "$sel" | cut -f2)
+session=$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null)
+# Only skip if the selected session is the one this client is already viewing.
+if [ "$kind" = "host" ]; then
+  cur=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  [ "$session" = "$cur" ] && exit 0
+fi
 
 parent=$(tmux show-options -gqv @claude_parent 2>/dev/null)
-session=$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null)
 
 if [ "$kind" = loose ]; then
   # Focus the pane in place on the outer client. This popup closes on its own

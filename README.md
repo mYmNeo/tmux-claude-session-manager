@@ -275,6 +275,73 @@ for exactly this — write it as `\$CLAUDE_PICKER` inside the double-quoted valu
 above so tmux stores a literal `$` (in a single-quoted value, use a bare
 `$CLAUDE_PICKER`).
 
+## OMP Integration
+
+This fork targets [Oh My Pi](https://github.com/can1357/oh-my-pi) (omp) instead
+of Claude Code. The tmux side is unchanged — same keys, same options — except
+`@claude_command` defaults to `omp`, and agent status comes from a registry the
+omp extension in [`omp-extension/`](./omp-extension) keeps up to date. The
+Claude Code plugin above does not apply here.
+
+### Install
+
+Link or copy `omp-extension/` into your omp agent extensions directory:
+
+```sh
+mkdir -p ~/.omp/agent/extensions
+ln -s "$PWD/omp-extension" ~/.omp/agent/extensions/claude-session-manager
+```
+
+Or point omp at this repo's `omp-extension` dir from `~/.omp/agent/config.yml`:
+
+```yaml
+extensions:
+  - /path/to/tmux-claude-session-manager/omp-extension
+```
+
+Then restart omp (or load once with `omp --extension /path/to/omp-extension`).
+If your layout puts the scripts somewhere else, set `CLAUDE_SESSION_MANAGER_DIR`
+to the plugin repo root.
+
+### What it does
+
+On `session_start` (only when omp is inside tmux) it installs the plugin's
+key bindings (`prefix` + `y`, `prefix` + `u`) and registers the session in
+`~/.omp/agent/claude-session-manager/registry.json`. omp lifecycle events keep
+each entry's status current: `agent_start` → `working`, `agent_end` → `idle`,
+an `ask` tool call → `waiting`. `agents.sh` reads that registry; the age column
+is the mtime of the newest session JSONL for the agent's cwd. Each change also
+refreshes the picker cache, so the first frame is not stale.
+
+It also adds two slash commands:
+
+| Command          | Action                                                  |
+| ---------------- | ------------------------------------------------------- |
+| `/claude-list`   | Open the agent picker popup (same as `prefix` + `u`)    |
+| `/claude-launch` | Launch or re-attach an omp session for the current dir |
+
+Outside tmux the commands just print a notice — no error, no crash.
+
+### "Don't kill yourself"
+
+The integration is built so omp can never manage — detach or kill — its own
+session. The omp extension records the pane omp actually runs in (read from
+omp's own `$TMUX_PANE` at `session_start`) into the tmux global
+`@claude_omp_pane`. The bash layer uses it in two places:
+
+- `list.sh` refuses to detach the session that contains that pane, so a
+  `prefix`+`u` (or `/claude-list`) from omp's own session can never detach omp.
+- `agents.sh` marks that pane as `host`: it sinks to the bottom and carries no
+  pid, so `ctrl-x` in the picker can never target it. The pane you opened the
+  picker from gets the same treatment (threaded into the popup as
+  `OMP_HOST_PANE` via tmux `#{pane_id}` expansion).
+
+Identity is carried by **tmux format expansion** (`#{pane_id}`), not by shell
+env vars — `$TMUX_PANE` is empty inside `run-shell` and is the popup's pane
+inside a popup, so relying on it would silently disable the guard. omp fires the
+popups detached (`stdio: ignore`, unref'd), so its event loop never blocks on an
+interactive fzf picker.
+
 ## License
 
 [MIT](LICENSE) © Takuya Matsuyama
