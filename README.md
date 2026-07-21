@@ -249,6 +249,64 @@ so tmux stores a literal `$` (in a single-quoted value, use a bare
   [Making Claude ring the bell](#making-claude-ring-the-bell). Set
   `@claude_forward_bell 'off'` to disable.
 
+## OMP Hooks Integration
+
+This plugin also works inside [Oh My Pi](https://github.com/) (omp) — the
+coding-agent harness — via omp's extension/hook system. When omp runs inside
+tmux, an omp **extension** wires the plugin's popups into omp's lifecycle so you
+can manage Claude Code sessions without leaving omp.
+
+### Install
+
+Copy `omp-extension/` into your omp agent extensions directory:
+
+```sh
+mkdir -p ~/.omp/agent/extensions
+cp -r omp-extension ~/.omp/agent/extensions/claude-session-manager
+```
+
+Or point omp at this repo's `omp-extension` dir from `~/.omp/agent/config.yml`:
+
+```yaml
+extensions:
+  - /path/to/tmux-claude-session-manager/omp-extension
+```
+
+Then restart omp (or load once with `omp --extension /path/to/omp-extension`).
+If your layout puts the scripts somewhere else, set `CLAUDE_SESSION_MANAGER_DIR`
+to the plugin repo root.
+
+### What it does
+
+On `session_start` (only when omp is inside tmux) it installs the plugin's
+key bindings (`prefix` + `y`, `prefix` + `u`). It also adds two slash commands:
+
+| Command         | Action                                                       |
+| --------------- | ------------------------------------------------------------ |
+| `/claude-list`  | Open the agent picker popup (same as `prefix` + `u`)         |
+| `/claude-launch`| Launch or re-attach a Claude session for the current dir      |
+
+Outside tmux the commands just print a notice — no error, no crash.
+
+### "Don't kill yourself"
+
+The integration is built so omp can never manage — detach or kill — its own
+session. The omp extension records the pane omp actually runs in (read from
+omp's own `$TMUX_PANE` at `session_start`) into the tmux global
+`@claude_omp_pane`. The bash layer uses it in two places:
+
+- `list.sh` refuses to detach any session that still contains that pane, so a
+  `prefix`+`u` (or `/claude-list`) from omp's own session can never detach omp.
+- `agents.sh` never lists that pane, so `ctrl-x` in the picker can never target
+  the Claude hosting omp. It also skips the pane you opened the picker from
+  (threaded into the popup as `OMP_HOST_PANE` via tmux `#{pane_id}` expansion).
+
+Identity is carried by **tmux format expansion** (`#{pane_id}`), not by shell
+env vars — `$TMUX_PANE` is empty inside `run-shell` and is the popup's pane
+inside a popup, so relying on it would silently disable the guard. omp fires the
+popups detached (`stdio: ignore`, unref'd), so its event loop never blocks on an
+interactive fzf picker.
+
 ## License
 
 [MIT](LICENSE) © Takuya Matsuyama

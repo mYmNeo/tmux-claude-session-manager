@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Emit one picker row per running Claude that lives in a tmux pane.
+# Emit one picker row per running omp agent that lives in a tmux pane.
 #
-# Claude self-reports its status: each session writes its own state to disk and a
-# supervisor daemon aggregates it, which `claude agents --json` publishes. So this
-# needs no Claude Code hooks, and no `pane_current_command` scan — on macOS a pane
-# reports its parent shell there, never the `claude` child running inside it.
+# Reads the session registry maintained live by the omp extension — written at
+# session_start with status "busy", then updated through lifecycle hooks
+# (agent_end → idle, tool_call ask → waiting) so the picker always sees
+# the current state.
+# The session id is derived from cwd by finding the most recent JSONL in the omp
+# session storage directory. That file's mtime is used for the age column — no
+# transcript daemon needed.
 #
 # Identity is the Claude process, not the tmux session. Joining pid -> tty -> pane
 # is what lets several Claudes in one project (same cwd, same session, different
@@ -17,14 +20,27 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=helpers.sh
 . "$DIR/helpers.sh"
 
-agents="$(claude agents --json 2>/dev/null)" || exit 0
-rows="$(printf '%s' "$agents" |
-  jq -r '.[] | select(.kind == "interactive") | [.pid, .status, .sessionId, .cwd] | @tsv' 2>/dev/null)"
+REGISTRY="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/claude-session-manager/registry.json"
+[ -f "$REGISTRY" ] || exit 0
+rows="$(jq -r '.[] | [.pid, .status, .cwd] | @tsv' "$REGISTRY" 2>/dev/null)"
 [ -n "$rows" ] || exit 0
+
+# Derive sessionId from cwd: encode cwd -> session dir name, find newest JSONL.
+rows="$(printf '%s\n' "$rows" | while IFS=$'\t' read pid status cwd; do
+  enc="-${cwd#"$HOME/"}"
+  enc="${enc//\//-}"
+  session_dir="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/sessions/$enc"
+  sid="unknown"
+  if [ -d "$session_dir" ]; then
+    newest="$(ls -t "$session_dir"/*.jsonl 2>/dev/null | head -1)"
+    [ -n "$newest" ] && sid="$(basename "$newest" .jsonl)"
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$pid" "$status" "$sid" "$cwd"
+done)"
 
 # Resolved out here because only `stat`, outside awk, can read an mtime.
 mtimes="$(printf '%s\n' "$rows" | cut -f3 | while IFS= read -r sid; do
-  printf 'M\t%s\t%s\n' "$sid" "$(claude_transcript_mtime "$sid")"
+  printf 'M\t%s\t%s\n' "$sid" "$(omp_session_mtime "$sid")"
 done)"
 
 # Three tagged streams into one awk: pid->tty, tty->pane, session->last-activity.
@@ -35,13 +51,17 @@ done)"
   printf '%s\n' "$mtimes"
   printf '%s\n' "$rows" | sed $'s/^/A\t/'
 } | awk -F'\t' -v now="$(date +%s)" -v home="$HOME" \
-  -v prefix="$(get_tmux_option @claude_session_prefix 'claude-')" '
+  -v prefix="$(get_tmux_option @claude_session_prefix 'claude-')" \
+  -v self_pane="${OMP_HOST_PANE:-${TMUX_PANE:-}}" -v omp_pane="$(tmux show-options -gqv @claude_omp_pane 2>/dev/null)" '
   $1 == "P" { tty_of[$2] = $3; next }
   $1 == "T" { sub(/^\/dev\//, "", $2); pane[$2] = $3; sess[$2] = $4; loc[$2] = $5; next }
   $1 == "M" { seen_at[$2] = $3; next }
   $1 == "A" {
     tty = tty_of[$2]
     if (tty == "" || !(tty in pane)) next   # this Claude is not running inside tmux
+    is_host = 0
+    if (self_pane != "" && pane[tty] == self_pane) is_host = 1
+    if (omp_pane != "" && pane[tty] == omp_pane) is_host = 1
 
     if      ($3 == "waiting") { icon = "\033[33m●\033[0m waiting"; rank = 0 }  # yellow - needs input
     else if ($3 == "idle")    { icon = "\033[32m●\033[0m idle   "; rank = 1 }  # green  - done, your turn
@@ -50,12 +70,15 @@ done)"
 
     age = (seen_at[$4] != "") ? int((now - seen_at[$4]) / 60) "m" : "-"
     kind = (index(sess[tty], prefix) == 1) ? "dedicated" : "loose"
+    if (is_host) kind = "host"
+    if (is_host) rank = 4  # host entries sink to the bottom
 
     path = $5
     if (index(path, home) == 1) path = "~" substr(path, length(home) + 1)
 
+    pid = (is_host) ? "-" : $2
     printf "%s\t%s\t%s\t%s\t%s\t%5s\t%s\t%s\n",
-      rank, pane[tty], $2, kind, icon, age, loc[tty], path
+      rank, pane[tty], pid, kind, icon, age, loc[tty], path
   }
 ' | sort -t$'\t' -k1,1n -k6,6n
 # rank asc (what needs you floats up), then age asc so whatever just went idle
