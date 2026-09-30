@@ -13,7 +13,7 @@ prefix="$(get_tmux_option @claude_session_prefix 'claude-')"
 cmd="$(get_tmux_option @claude_command 'omp')"
 args="$(get_tmux_option @claude_args '')"
 [ -n "$args" ] && cmd="$cmd $args"
-w="$(get_tmux_option @claude_popup_width '90%')"
+w="$(get_tmux_option @claude_popup_width '95%')"
 h="$(get_tmux_option @claude_popup_height '90%')"
 
 session="${prefix}$(session_hash "$path")"
